@@ -1,16 +1,35 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
 
 # Virtual environments
 venv/
+.venv/
+env/
 .env
+.env.*
 
 # OS files
 .DS_Store
 
 # Experiment outputs
 reports/*.json
+reports/*.png
 
 # Logs
 *.log
+
+# Coverage and build artifacts
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+
+# IDE/editor
+.idea/
