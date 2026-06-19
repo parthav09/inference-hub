@@ -32,4 +32,4 @@ build/
 dist/
 
 # IDE/editor
-.idea/
+.idea/.venv/
