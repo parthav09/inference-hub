@@ -1,0 +1,12 @@
+services:
+  inference:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      CACHE_MAX_SIZE: "256"
+      CACHE_TTL_SECONDS: "30"
+      CACHE_ENABLED: "true"
+      PREFIX_K: "4"

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.env
+
+# OS files
+.DS_Store
+
+# Experiment outputs
+reports/*.json
+
+# Logs
+*.log
