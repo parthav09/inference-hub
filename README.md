@@ -1,139 +1,211 @@
 # Inference Hub
 
-Inference Hub is an experimental FastAPI service for exploring embedding caching, inference latency, and cache-control policies around a small PyTorch Transformer encoder.
+Inference Hub is an experimental inference service built to study one practical question:
 
-This repository is a prototype, not a production inference system. The model is randomly initialized and untrained, cache state is process-local, and several policy/configuration modules are not yet integrated.
+> Can reusable model embeddings reduce inference latency without introducing unacceptable correctness risk?
 
-## What the service does
+The project combines a small Transformer-based model, an in-memory embedding cache, a policy that can disable caching, and a set of latency experiments. It is intended as a systems prototype for reasoning about the trade-off between speed and correctness—not as a trained prediction product or production-ready serving platform.
 
-For each `POST /predict` request, the service:
+## The problem being explored
 
-1. Accepts `data` as a sequence of 32-feature rows.
-2. Converts it to a tensor with shape `(1, sequence_length, 32)`.
-3. Builds a SHA-256 cache key from the first four sequence rows.
-4. Looks up a cached pooled embedding when `use_cache` is `true`.
-5. On a miss, runs the Transformer backbone and attempts to cache the resulting 96-dimensional embedding.
-6. Runs a prediction head that produces 32 sigmoid outputs and returns their mean as one scalar prediction.
-7. Computes a risk score from the embedding norm and enables or disables the global cache for subsequent requests.
-8. Records request latency in memory.
+Model inference often repeats work. If multiple requests contain the same reusable input region, the service may be able to cache an intermediate model representation and skip part of the computation on later requests.
 
-The service exposes health, prediction, cache statistics, and latency statistics endpoints.
+That creates two competing goals:
 
-## Important current behavior
+- **Performance:** reduce repeated computation and improve latency, especially p95 and p99 tail latency.
+- **Correctness:** avoid reusing an embedding when the underlying input has changed enough that the cached representation is no longer valid.
 
-The following details are important when interpreting results:
+Inference Hub makes both sides observable. It records latency and cache behavior while applying a simple risk policy that decides whether the cache should remain enabled.
 
-- The model has no trained weights or checkpoint. Predictions are random and change when the process restarts.
-- `use_cache=false` skips the cache lookup, but the newly computed embedding is still written to the cache if the global cache is enabled. It is therefore a cache-read bypass, not a strict no-cache mode.
-- The cache key uses the first four **sequence rows**, not the first four scalar features. With the one-row requests used by `load_test.py`, the key represents the entire row.
-- The load test reuses identical inputs. It does not test reuse across different inputs that merely share a four-value feature prefix.
-- For sequences longer than four rows, different sequences with the same first four rows receive the same key even though the cached embedding represents the full sequence. This can return an incorrect embedding.
-- The risk score is `norm(embedding) / 10`. Because the backbone ends with a 96-dimensional `LayerNorm`, a typical score is about `0.98`, above the `0.8` threshold. The first request therefore normally disables caching for later requests.
-- The policy is applied after lookup, inference, and cache insertion, so a policy decision affects later requests rather than the request that produced the score.
-- Cache contents, cache statistics, and latency records are in-memory global state. They reset on restart and are not shared between multiple worker processes.
-- The request schema checks that `data` is nested, but does not enforce non-empty input or a row width of 32. Invalid dimensions fail during model execution.
+## System design
 
-## Project structure
+The service accepts a sequence in which each row contains 32 numeric features. A request moves through the following pipeline:
+
+```mermaid
+flowchart LR
+    A["POST /predict"] --> B["Create input tensor"]
+    B --> C["Build cache key"]
+    C --> D{"Cache read requested?"}
+    D -- "Yes" --> E{"Embedding found?"}
+    D -- "No" --> F["Run Transformer encoder"]
+    E -- "Yes" --> G["Reuse cached embedding"]
+    E -- "No" --> F
+    F --> H["Attempt cache write"]
+    G --> I["Run prediction head"]
+    H --> I
+    I --> J["Calculate risk score"]
+    J --> K["Update cache policy"]
+    K --> L["Record latency"]
+    L --> M["Return prediction"]
+```
+
+### Model
+
+The PyTorch model has two stages:
+
+1. A Transformer encoder converts the input sequence into a pooled 96-dimensional embedding.
+2. A prediction head converts that embedding into 32 sigmoid outputs.
+
+The API returns the mean of those 32 outputs as a single prediction.
+
+The model is randomly initialized and has no trained checkpoint. Its purpose is to provide realistic inference computation for cache and latency experiments. The prediction itself has no domain meaning and changes when the process restarts.
+
+### Embedding cache
+
+The cache is an in-memory LRU cache with:
+
+- Maximum size: 256 entries
+- TTL: 30 seconds from insertion
+- LRU eviction when capacity is exceeded
+- Hit, miss, expiration, eviction, and hit-rate counters
+
+The current cache key is a SHA-256 hash of the first four **sequence rows**. This distinction matters: the key does not use the first four scalar features.
+
+The benchmark sends one-row sequences, so its key represents the complete input row. For longer sequences, two inputs with identical first four rows but different later rows receive the same key even though the cached embedding represents the full sequence. That is a known correctness risk in the current prototype.
+
+### Cache-control policy
+
+After inference, the service calculates:
 
 ```text
-app/
-  main.py       FastAPI routes and the active cache policy
-  model.py      Transformer encoder and prediction head
-  cache.py      In-memory LRU cache with insertion-time TTL
-  tracker.py    In-memory latency percentile tracking
-  schemas.py    Request and response models
-  config.py     Environment configuration declarations (not wired in)
-
-agent/
-  policy.py     Standalone policy prototype (not used by the API)
-  controller.py Standalone cache controller prototype (not used by the API)
-
-experiments/
-  load_test.py               HTTP latency experiments
-  plot_day3.py               Benchmark chart generation
-  drift_sim.py               Synthetic feature drift helper
-  correctness.py             Embedding-distance helpers
-  correctness_experiment.py  Stale prototype; currently not runnable
-
-docker/
-  Dockerfile
-  docker-compose.yml
-
-reports/         Generated benchmark JSON and plots
+risk_score = embedding_norm / 10
 ```
 
-The standalone agent prototype is currently disconnected from `app/main.py`. It also returns lowercase decisions in `agent/policy.py` while `agent/controller.py` expects uppercase decision names, so the two files do not work together without modification.
+If the score is greater than `0.8`, caching is disabled globally for following requests. Otherwise, it is enabled.
 
-`experiments/correctness_experiment.py` currently imports a nonexistent `Model` class and calls a nonexistent `encode()` method. It must be updated to use `InferenceModel` before it can run.
+Because the 96-dimensional embedding is passed through `LayerNorm`, its norm is typically close to `sqrt(96)`. The resulting risk score is therefore usually around `0.98`, which means the first prediction normally disables the cache.
 
-## Requirements
+This is useful as a demonstration of policy-controlled infrastructure, but the threshold is not calibrated well enough for a meaningful cache-performance comparison yet.
 
-- Python 3.10 or newer
-- Docker with Docker Compose, if using the container setup
+## What is measured
 
-Core dependencies are listed in `requirements.txt`. The plotting and drift helpers also require `matplotlib` and `numpy`, which are not currently listed there.
+The project records two different views of latency.
 
-## Setup
+### Service latency
 
-### Docker
+`POST /predict` measures time inside the API handler. This includes:
 
-From the repository root:
+- Tensor creation
+- Cache lookup
+- Model embedding computation on a miss
+- Prediction-head computation
+- Risk evaluation
 
-```bash
-docker compose -f docker/docker-compose.yml up --build
-```
+The service stores these measurements in memory and exposes:
 
-The API is available at [http://localhost:8000](http://localhost:8000).
+- **p50:** median request latency
+- **p95:** latency below which 95% of requests completed
+- **p99:** latency below which 99% of requests completed
+- **count:** number of recorded requests
 
-The Compose file declares `CACHE_MAX_SIZE`, `CACHE_TTL_SECONDS`, `CACHE_ENABLED`, and `PREFIX_K`, but the running application does not currently read those settings. It always starts with the defaults defined directly in `app/cache.py` and `app/main.py`: maximum size `256`, TTL `30` seconds, cache enabled, and four sequence rows in the key.
+### Client-observed latency
 
-### Local environment
+`experiments/load_test.py` measures elapsed time around the complete HTTP request. It therefore includes service execution plus local HTTP and scheduling overhead.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
+The experiment report contains:
 
-To use the plotting or drift scripts, install their currently unpinned dependencies:
+- Mean latency
+- p50 latency
+- p95 latency
+- p99 latency
+- Request count
 
-```bash
-python -m pip install matplotlib numpy
-```
+### Cache metrics
 
-## API
+`GET /stats` reports:
 
-Interactive OpenAPI documentation is available at [http://localhost:8000/docs](http://localhost:8000/docs) while the service is running.
+- Cache hits and misses
+- Expired entries
+- LRU evictions
+- Hit rate as an integer percentage
+- Whether the policy currently allows cache use
 
-### Health
+These metrics are process-local and reset whenever the service restarts.
 
-```bash
-curl http://localhost:8000/health
-```
+## Experiment design
 
-Example response:
+The current load test runs three workloads against `POST /predict`:
+
+| Workload | Requests | Concurrency | Input | Cache-read flag |
+|---|---:|---:|---|---|
+| Baseline | 100 | 10 | Identical one-row sequence | Disabled |
+| Cached-prefix reuse | 100 | 10 | Identical one-row sequence | Enabled |
+| Larger cached workload | 250 | 10 | Identical one-row sequence | Enabled |
+
+The third workload is named `bursty_cached` in the report, although it increases the request count rather than concurrency.
+
+`use_cache=false` currently bypasses cache reads only. If the global cache is enabled, the newly computed embedding can still be written to the cache. It is therefore not a strict no-cache baseline.
+
+## Recorded latency results
+
+A sample local run generated the following `reports/day3_results.json` measurements:
+
+| Workload | Mean | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| Baseline, 100 requests | 32.82 ms | 20.55 ms | 146.66 ms | 152.02 ms |
+| Cached-prefix reuse, 100 requests | 22.49 ms | 21.27 ms | 35.97 ms | 38.46 ms |
+| Larger cached workload, 250 requests | 21.35 ms | 20.90 ms | 25.79 ms | 36.17 ms |
+
+Relative to the recorded baseline, the cached-prefix run shows:
+
+- 31.5% lower mean latency
+- 3.5% higher p50 latency
+- 75.5% lower p95 latency
+- 74.7% lower p99 latency
+
+![Baseline and cached latency comparison](reports/day3_latency_comparison.png)
+
+### How to interpret these results
+
+The lower mean and tail measurements are observations from one local run. They cannot currently be attributed confidently to cache reuse.
+
+The active risk policy normally disables the cache after the first prediction, and the load test does not record whether each request was a cache hit. Warm-up effects, Python scheduling, model initialization, and machine load can therefore explain part or all of the difference.
+
+A defensible cache benchmark should:
+
+1. Use a calibrated or temporarily fixed cache policy.
+2. Clear and reset service state before every workload.
+3. Make the baseline bypass both cache reads and writes.
+4. Record cache-hit status for every request.
+5. Run multiple trials and report variation or confidence intervals.
+6. Separate warm-up requests from measured requests.
+7. Test both exact input reuse and safe prefix reuse.
+
+The current results demonstrate the measurement pipeline, but they should not be treated as a final performance claim.
+
+## Correctness and drift work
+
+The repository includes an early correctness experiment intended to:
+
+1. Generate features that drift over time.
+2. Compare a cached embedding with a freshly computed embedding.
+3. Measure cosine and L2 distance.
+4. Treat embedding divergence as correctness risk.
+
+That is the intended bridge between cache performance and cache safety. However, `experiments/correctness_experiment.py` is currently stale: it imports a nonexistent `Model` class and calls a nonexistent `encode()` method. It must be updated to use `InferenceModel` before this experiment can produce valid results.
+
+## API surface
+
+The service exposes three endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /predict` | Run inference, optionally attempt cache reuse, and return prediction latency |
+| `GET /stats` | Inspect cache counters and latency percentiles |
+| `GET /health` | Check service health and whether caching is currently enabled |
+
+A prediction request has this shape:
 
 ```json
 {
-  "status": "ok",
-  "cache_enabled": true
+  "data": [[1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
+  "use_cache": true
 }
 ```
 
-`cache_enabled` will normally become `false` after the first prediction because of the current risk calculation.
+Each inner row must contain 32 values. The current schema does not validate that width before model execution.
 
-### Predict
-
-Each inner array represents one sequence row and must contain exactly 32 numeric features for the current model.
-
-```bash
-curl -X POST http://localhost:8000/predict \
-  -H "Content-Type: application/json" \
-  -d '{"data":[[1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]],"use_cache":true}'
-```
-
-Response shape:
+The response contains:
 
 ```json
 {
@@ -143,65 +215,65 @@ Response shape:
 }
 ```
 
-The numeric values vary by process and machine.
+## Repository map
 
-### Statistics
+```text
+app/
+  main.py       Request flow, cache lookup, active policy, and API routes
+  model.py      Transformer encoder and prediction head
+  cache.py      In-memory LRU and TTL cache
+  tracker.py    In-process latency percentile tracking
+  schemas.py    API request and response models
+  config.py     Environment settings that are not yet wired into the service
 
-```bash
-curl http://localhost:8000/stats
+agent/
+  policy.py     Standalone policy prototype
+  controller.py Standalone cache controller prototype
+
+experiments/
+  load_test.py               HTTP latency benchmark
+  plot_day3.py               Latency chart generation
+  drift_sim.py               Synthetic feature drift
+  correctness.py             Embedding-distance functions
+  correctness_experiment.py  Incomplete correctness experiment
+
+reports/
+  day3_results.json              Generated benchmark data (gitignored)
+  day3_latency_comparison.png    Tracked sample chart
 ```
 
-The response contains:
+The standalone files in `agent/` are not used by the API. They also disagree on decision naming: the policy returns lowercase values while the controller expects uppercase values.
 
-- Cache state and counters: `enabled`, `max_size`, `ttl_seconds`, `hits`, `miss`, `expire`, `evict`, and integer percentage `hit_rate`.
-- In-process latency statistics: `count`, `p50`, `p95`, and `p99`.
+The Docker Compose file declares cache environment variables, but `app/main.py` does not currently consume `app/config.py`. Runtime cache settings are therefore still the hard-coded defaults.
 
-## Running the benchmark
+## Reproducing the experiment
 
-Start the API first, then run:
+The service can be started with:
+
+```bash
+docker compose -f docker/docker-compose.yml up --build
+```
+
+With the API running on port `8000`, generate the measurements and chart with:
 
 ```bash
 python experiments/load_test.py
-```
-
-The script sends three workloads to `http://localhost:8000/predict`:
-
-1. 100 identical requests with cache reads bypassed.
-2. 100 identical requests with cache reads requested.
-3. 250 identical requests with cache reads requested.
-
-All workloads use concurrency `10`. Results are written to:
-
-```text
-reports/day3_results.json
-```
-
-Because the active risk policy normally disables the cache after the first prediction, the labels `cached_prefix_reuse` and `bursty_cached` do not guarantee cache hits. Check `GET /stats` when evaluating benchmark behavior.
-
-Generate the comparison chart after the JSON report exists:
-
-```bash
 python experiments/plot_day3.py
 ```
 
-Output:
+The load test requires `httpx`. Plotting additionally requires `matplotlib`; the drift helper requires `numpy`. The latter two are not currently declared in `requirements.txt`.
 
-```text
-reports/day3_latency_comparison.png
-```
+## Project status
 
-The chart compares mean and p95 latency for the first two workloads.
+Inference Hub currently proves out the shape of a cache-aware inference experiment:
 
-## Highest-priority improvements
+- A model can expose and reuse intermediate embeddings.
+- Cache behavior and latency can be observed through one service.
+- A policy can change serving behavior based on a risk signal.
+- Performance and correctness experiments can share the same model path.
 
-- Wire `app/config.py` into cache construction and cache-key generation.
-- Decide whether `use_cache=false` should disable both reads and writes.
-- Replace the current key with one that matches the embedding being cached, or cache a true reusable prefix state.
-- Calibrate and configure the risk policy so cache-enabled experiments can produce actual hits.
-- Integrate the agent policy/controller and standardize their decision values.
-- Repair the correctness experiment and add its dependencies to `requirements.txt`.
-- Add strict request dimension validation, tests, synchronization for shared state, and production observability.
+The next engineering step is to make the experiment scientifically valid: fix cache semantics, calibrate the policy, repair correctness measurement, isolate benchmark runs, and connect cache decisions to measured embedding drift.
 
 ## License
 
-No license file is currently included. Add a license before distributing or accepting external contributions.
+No license file is currently included.
