@@ -15,11 +15,11 @@ That creates two competing goals:
 - **Performance:** reduce repeated computation and improve latency, especially p95 and p99 tail latency.
 - **Correctness:** avoid reusing an embedding when the underlying input has changed enough that the cached representation is no longer valid.
 
-Inference Hub makes both sides observable. It records latency and cache behavior while applying a simple risk policy that decides whether the cache should remain enabled.
+Inference Hub currently makes the performance side observable by recording latency and cache behavior. It also applies a simple internal risk policy, but the risk score is not returned or stored as a metric. The separate correctness experiment intended to measure embedding drift is currently incomplete.
 
 ## System design
 
-The service accepts a sequence in which each row contains 32 numeric features. A request moves through the following pipeline:
+The model expects a sequence in which each row contains 32 numeric features. A request moves through the following pipeline:
 
 ```mermaid
 flowchart LR
@@ -48,18 +48,20 @@ The PyTorch model has two stages:
 
 The API returns the mean of those 32 outputs as a single prediction.
 
-The model is randomly initialized and has no trained checkpoint. Its purpose is to provide realistic inference computation for cache and latency experiments. The prediction itself has no domain meaning and changes when the process restarts.
+The model is randomly initialized and has no trained checkpoint. Its purpose is to provide nontrivial inference computation for cache and latency experiments. The prediction itself has no domain meaning and normally changes when a new process creates a new randomly initialized model.
 
 ### Embedding cache
 
-The cache is an in-memory LRU cache with:
+The active cache uses these hard-coded defaults:
 
 - Maximum size: 256 entries
-- TTL: 30 seconds from insertion
+- TTL: 30 seconds from the most recent insertion or update
 - LRU eviction when capacity is exceeded
 - Hit, miss, expiration, eviction, and hit-rate counters
 
-The current cache key is a SHA-256 hash of the first four **sequence rows**. This distinction matters: the key does not use the first four scalar features.
+Expiration is lazy: an expired entry is removed only when that key is read. Cache reads attempted while the cache is globally disabled are counted as misses.
+
+The current cache key is a SHA-256 hash of the Python string representation of the first four **sequence rows**. This distinction matters: the key does not use the first four scalar features.
 
 The benchmark sends one-row sequences, so its key represents the complete input row. For longer sequences, two inputs with identical first four rows but different later rows receive the same key even though the cached embedding represents the full sequence. That is a known correctness risk in the current prototype.
 
@@ -75,7 +77,7 @@ If the score is greater than `0.8`, caching is disabled globally for following r
 
 Because the 96-dimensional embedding is passed through `LayerNorm`, its norm is typically close to `sqrt(96)`. The resulting risk score is therefore usually around `0.98`, which means the first prediction normally disables the cache.
 
-This is useful as a demonstration of policy-controlled infrastructure, but the threshold is not calibrated well enough for a meaningful cache-performance comparison yet.
+This score is an embedding-magnitude heuristic; it does not measure prediction error or embedding drift. It is useful as a demonstration of policy-controlled infrastructure, but the threshold is not calibrated well enough for a meaningful cache-performance comparison yet.
 
 ## What is measured
 
@@ -93,10 +95,10 @@ The project records two different views of latency.
 
 The service stores these measurements in memory and exposes:
 
-- **p50:** median request latency
-- **p95:** latency below which 95% of requests completed
-- **p99:** latency below which 99% of requests completed
+- **p50, p95, and p99:** index-based order-statistic approximations from the sorted latency list
 - **count:** number of recorded requests
+
+The service implementation does not interpolate percentiles. For example, with 100 measurements it returns sorted-list elements 51, 96, and 100 for p50, p95, and p99 respectively. Its p50 is therefore not always the mathematical median.
 
 ### Client-observed latency
 
@@ -105,9 +107,8 @@ The service stores these measurements in memory and exposes:
 The experiment report contains:
 
 - Mean latency
-- p50 latency
-- p95 latency
-- p99 latency
+- Median latency, stored as `p50`
+- p95 and p99 estimates from Python's `statistics.quantiles`
 - Request count
 
 ### Cache metrics
@@ -117,7 +118,7 @@ The experiment report contains:
 - Cache hits and misses
 - Expired entries
 - LRU evictions
-- Hit rate as an integer percentage
+- Hit rate as an integer percentage rounded upward with `ceil`
 - Whether the policy currently allows cache use
 
 These metrics are process-local and reset whenever the service restarts.
@@ -138,13 +139,15 @@ The third workload is named `bursty_cached` in the report, although it increases
 
 ## Recorded latency results
 
-A sample local run generated the following `reports/day3_results.json` measurements:
+The generated `reports/day3_results.json` currently present in this workspace contains:
 
 | Workload | Mean | p50 | p95 | p99 |
 |---|---:|---:|---:|---:|
 | Baseline, 100 requests | 32.82 ms | 20.55 ms | 146.66 ms | 152.02 ms |
 | Cached-prefix reuse, 100 requests | 22.49 ms | 21.27 ms | 35.97 ms | 38.46 ms |
 | Larger cached workload, 250 requests | 21.35 ms | 20.90 ms | 25.79 ms | 36.17 ms |
+
+The JSON report is ignored by Git, so it is a local generated artifact rather than a file included in a fresh clone. The comparison chart shown below is tracked in the repository.
 
 Relative to the recorded baseline, the cached-prefix run shows:
 
@@ -159,7 +162,7 @@ Relative to the recorded baseline, the cached-prefix run shows:
 
 The lower mean and tail measurements are observations from one local run. They cannot currently be attributed confidently to cache reuse.
 
-The active risk policy normally disables the cache after the first prediction, and the load test does not record whether each request was a cache hit. Warm-up effects, Python scheduling, model initialization, and machine load can therefore explain part or all of the difference.
+The active risk policy normally disables the cache after the first prediction, and the load test does not record whether each request was a cache hit. First-forward or kernel warm-up, Python scheduling, and machine load can therefore explain part or all of the difference.
 
 A defensible cache benchmark should:
 
@@ -182,7 +185,7 @@ The repository includes an early correctness experiment intended to:
 3. Measure cosine and L2 distance.
 4. Treat embedding divergence as correctness risk.
 
-That is the intended bridge between cache performance and cache safety. However, `experiments/correctness_experiment.py` is currently stale: it imports a nonexistent `Model` class and calls a nonexistent `encode()` method. It must be updated to use `InferenceModel` before this experiment can produce valid results.
+That is the intended bridge between cache performance and cache safety. However, `experiments/correctness_experiment.py` is currently stale: it imports a nonexistent `Model` class and calls a nonexistent `encode()` method. Those references need to become `InferenceModel` and `get_embedding()` before the experiment can run.
 
 ## API surface
 
@@ -205,7 +208,7 @@ A prediction request has this shape:
 
 Each inner row must contain 32 values. The current schema does not validate that width before model execution.
 
-The response contains:
+The response has the following shape; the numeric values below are illustrative:
 
 ```json
 {
@@ -265,12 +268,12 @@ The load test requires `httpx`. Plotting additionally requires `matplotlib`; the
 
 ## Project status
 
-Inference Hub currently proves out the shape of a cache-aware inference experiment:
+Inference Hub currently implements the main path of a cache-aware inference experiment:
 
-- A model can expose and reuse intermediate embeddings.
+- The API can compute, cache, and reuse pooled model embeddings when the request asks for a cache read and the global policy permits access.
 - Cache behavior and latency can be observed through one service.
 - A policy can change serving behavior based on a risk signal.
-- Performance and correctness experiments can share the same model path.
+- The repository contains drift and embedding-distance helpers, but the end-to-end correctness experiment does not currently run.
 
 The next engineering step is to make the experiment scientifically valid: fix cache semantics, calibrate the policy, repair correctness measurement, isolate benchmark runs, and connect cache decisions to measured embedding drift.
 
