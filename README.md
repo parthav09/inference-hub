@@ -15,7 +15,7 @@ That creates two competing goals:
 - **Performance:** reduce repeated computation and improve latency, especially p95 and p99 tail latency.
 - **Correctness:** avoid reusing an embedding when the underlying input has changed enough that the cached representation is no longer valid.
 
-Inference Hub currently makes the performance side observable by recording latency and cache behavior. It also applies a simple internal risk policy, but the risk score is not returned or stored as a metric. The separate correctness experiment intended to measure embedding drift is currently incomplete.
+Inference Hub currently makes the performance side observable by recording latency and cache behavior. It also applies a simple internal risk policy, but the risk score is not returned or stored as a metric. The separate correctness experiment now runs as a standalone drift measurement, but it is not integrated with API cache decisions.
 
 ## System design
 
@@ -52,7 +52,7 @@ The model is randomly initialized and has no trained checkpoint. Its purpose is 
 
 ### Embedding cache
 
-The active cache uses these hard-coded defaults:
+The active cache reads `CACHE_MAX_SIZE`, `CACHE_TTL_SECONDS`, and `CACHE_ENABLED` from `app/config.py`. Without environment overrides, it uses:
 
 - Maximum size: 256 entries
 - TTL: 30 seconds from the most recent insertion or update
@@ -71,14 +71,15 @@ The benchmark sends one-row sequences, so its key represents the complete input 
 After inference, the service calculates:
 
 ```text
-risk_score = embedding_norm / 10
+expected_norm = sqrt(embedding_dimension)
+risk_score = abs(embedding_norm - expected_norm) / expected_norm
 ```
 
-If the score is greater than `0.8`, caching is disabled globally for following requests. Otherwise, it is enabled.
+If the score is greater than `0.8`, caching is disabled globally for following requests. Otherwise, caching is reset to the configured `CACHE_ENABLED` value.
 
-Because the 96-dimensional embedding is passed through `LayerNorm`, its norm is typically close to `sqrt(96)`. The resulting risk score is therefore usually around `0.98`, which means the first prediction normally disables the cache.
+Because the 96-dimensional embedding is passed through `LayerNorm`, its norm is typically close to `sqrt(96)`. The resulting risk score is therefore usually near zero, which means this policy generally leaves caching at its configured value for normal embeddings.
 
-This score is an embedding-magnitude heuristic; it does not measure prediction error or embedding drift. It is useful as a demonstration of policy-controlled infrastructure, but the threshold is not calibrated well enough for a meaningful cache-performance comparison yet.
+This score is an embedding-norm deviation heuristic; it does not measure prediction error or embedding drift. It is useful as a demonstration of policy-controlled infrastructure, but the threshold is not calibrated well enough for a meaningful cache-performance comparison yet.
 
 ## What is measured
 
@@ -164,7 +165,7 @@ Relative to the recorded baseline, the cached-prefix run shows:
 
 The lower mean and tail measurements are observations from one local run. They cannot currently be attributed confidently to cache reuse.
 
-The active risk policy normally disables the cache after the first prediction, and the load test does not record whether each request was a cache hit. First-forward or kernel warm-up, Python scheduling, and machine load can therefore explain part or all of the difference.
+The active risk policy usually leaves caching at its configured value for normal embeddings, but the load test does not record whether each request was a cache hit. First-forward or kernel warm-up, Python scheduling, and machine load can therefore explain part or all of the difference.
 
 A defensible cache benchmark should:
 
@@ -187,7 +188,7 @@ The repository includes an early correctness experiment intended to:
 3. Measure cosine and L2 distance.
 4. Treat embedding divergence as correctness risk.
 
-That is the intended bridge between cache performance and cache safety. However, `experiments/correctness_experiment.py` is currently stale: it imports a nonexistent `Model` class and calls a nonexistent `encode()` method. Those references need to become `InferenceModel` and `get_embedding()` before the experiment can run.
+That is the intended bridge between cache performance and cache safety. `experiments/correctness_experiment.py` now imports `InferenceModel` and calls `get_embedding()`, so it can run as a standalone drift probe. It still does not drive API cache decisions or validate a production correctness threshold.
 
 ## API surface
 
@@ -229,7 +230,7 @@ app/
   cache.py      In-memory LRU and TTL cache
   tracker.py    In-process latency percentile tracking
   schemas.py    API request and response models
-  config.py     Environment settings that are not yet wired into the service
+  config.py     Environment-backed cache settings
 
 agent/
   policy.py     Standalone policy prototype
@@ -240,7 +241,7 @@ experiments/
   plot_day3.py               Latency chart generation
   drift_sim.py               Synthetic feature drift
   correctness.py             Embedding-distance functions
-  correctness_experiment.py  Incomplete correctness experiment
+  correctness_experiment.py  Standalone correctness and drift experiment
 
 reports/
   day3_results.json              Generated benchmark data (gitignored)
@@ -249,7 +250,7 @@ reports/
 
 The standalone files in `agent/` are not used by the API. The policy and controller use the same decisions: `NORMAL`, `SHORT_TTL`, and `DISABLE_CACHE`.
 
-The Docker Compose file declares cache environment variables, but `app/main.py` does not currently consume `app/config.py`. Runtime cache settings are therefore still the hard-coded defaults.
+`app/main.py` consumes `CACHE_MAX_SIZE`, `CACHE_TTL_SECONDS`, and `CACHE_ENABLED` from `app/config.py`, so those runtime settings can be overridden through the environment. `PREFIX_K` is declared in `app/config.py` and Docker Compose, but `make_cache_key()` still uses its function default of `4`.
 
 ## Reproducing the experiment
 
@@ -275,9 +276,9 @@ Inference Hub currently implements the main path of a cache-aware inference expe
 - The API can compute, cache, and reuse pooled model embeddings when the request asks for a cache read and the global policy permits access.
 - Cache behavior and latency can be observed through one service.
 - A policy can change serving behavior based on a risk signal.
-- The repository contains drift and embedding-distance helpers, but the end-to-end correctness experiment does not currently run.
+- The repository contains drift and embedding-distance helpers, and the standalone correctness experiment can measure embedding divergence over generated drift.
 
-The next engineering step is to make the experiment scientifically valid: fix cache semantics, calibrate the policy, repair correctness measurement, isolate benchmark runs, and connect cache decisions to measured embedding drift.
+The next engineering step is to make the experiment scientifically valid: fix cache semantics, calibrate the policy, isolate benchmark runs, and connect cache decisions to measured embedding drift.
 
 ## License
 
