@@ -8,11 +8,11 @@ if PROJECT_ROOT not in sys.path:
 
 import torch
 import time
-from app.model import Model
+from app.model import InferenceModel
 from experiments.drift_sim import generate_drifted_features
 from experiments.correctness import cosine_distance, l2_distance
 
-model = Model()
+model = InferenceModel()
 
 def run_correctness_experiment(steps=20):
     cached_embedding = None
@@ -23,7 +23,7 @@ def run_correctness_experiment(steps=20):
 
         x = torch.tensor(features).unsqueeze(0).unsqueeze(0).float()
 
-        fresh_embedding = model.encode(x)
+        fresh_embedding = model.get_embedding(x)
 
         if cached_embedding is None:
             cached_embedding = fresh_embedding

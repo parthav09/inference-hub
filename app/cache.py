@@ -1,6 +1,5 @@
 import time
 from collections import OrderedDict
-import math
 
 class LRUTTLCache:
     def __init__(self, max_size=256, ttl_seconds = 30):
@@ -61,17 +60,17 @@ class LRUTTLCache:
 
     def stats(self):
         total = self.hits + self.miss
-        hit_rate = self.hits / total if total > 0 else 0
+        hit_rate = self.hits / total if total > 0 else 0.0
 
         return {
             "policy": "LRU with TTL",
             "enabled": self.enabled,
+            "size": len(self.dicts),
             "max_size": self.max_size,
             "ttl_seconds": self.ttl,
             "hits": self.hits,
             "miss": self.miss,
             "expire": self.expire,
             "evict": self.evict,
-            "hit_rate": math.ceil(hit_rate * 100)
+            "hit_rate": round(hit_rate, 3)
         }
-

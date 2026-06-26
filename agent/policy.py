@@ -3,9 +3,9 @@ class AgentPolicy:
 
     def decide(self, value):
         if value.get("correctness_risk", 0) > 0.8:
-            return "disable_cache"
+            return "DISABLE_CACHE"
         
         if value.get("drift_score", 0) > 0.6:
-            return "short_ttl"
+            return "SHORT_TTL"
     
-        return "normal"
+        return "NORMAL"

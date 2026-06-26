@@ -57,7 +57,8 @@ The active cache uses these hard-coded defaults:
 - Maximum size: 256 entries
 - TTL: 30 seconds from the most recent insertion or update
 - LRU eviction when capacity is exceeded
-- Hit, miss, expiration, eviction, and hit-rate counters
+- Current size plus hit, miss, expiration, and eviction counters
+- Hit rate as a decimal ratio rounded to three places
 
 Expiration is lazy: an expired entry is removed only when that key is read. Cache reads attempted while the cache is globally disabled are counted as misses.
 
@@ -116,9 +117,10 @@ The experiment report contains:
 `GET /stats` reports:
 
 - Cache hits and misses
+- Current cache size
 - Expired entries
 - LRU evictions
-- Hit rate as an integer percentage rounded upward with `ceil`
+- Hit rate as a decimal ratio rounded to three places
 - Whether the policy currently allows cache use
 
 These metrics are process-local and reset whenever the service restarts.
@@ -131,11 +133,11 @@ The current load test runs three workloads against `POST /predict`:
 |---|---:|---:|---|---|
 | Baseline | 100 | 10 | Identical one-row sequence | Disabled |
 | Cached-prefix reuse | 100 | 10 | Identical one-row sequence | Enabled |
-| Larger cached workload | 250 | 10 | Identical one-row sequence | Enabled |
+| Larger cached workload | 250 | 50 | Identical one-row sequence | Enabled |
 
-The third workload is named `bursty_cached` in the report, although it increases the request count rather than concurrency.
+The third workload is named `bursty_cached` in the report and increases both request count and concurrency.
 
-`use_cache=false` currently bypasses cache reads only. If the global cache is enabled, the newly computed embedding can still be written to the cache. It is therefore not a strict no-cache baseline.
+`use_cache=false` bypasses both cache reads and writes, providing a strict no-cache baseline.
 
 ## Recorded latency results
 
@@ -245,7 +247,7 @@ reports/
   day3_latency_comparison.png    Tracked sample chart
 ```
 
-The standalone files in `agent/` are not used by the API. They also disagree on decision naming: the policy returns lowercase values while the controller expects uppercase values.
+The standalone files in `agent/` are not used by the API. The policy and controller use the same decisions: `NORMAL`, `SHORT_TTL`, and `DISABLE_CACHE`.
 
 The Docker Compose file declares cache environment variables, but `app/main.py` does not currently consume `app/config.py`. Runtime cache settings are therefore still the hard-coded defaults.
 

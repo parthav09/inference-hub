@@ -17,6 +17,6 @@ class Controller:
             self.cache.enabled = True
             self.cache.ttl = 5
 
-        else:
+        else:  # NORMAL
             self.cache.enabled = True
             self.cache.ttl = self.default_ttl

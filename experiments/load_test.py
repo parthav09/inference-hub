@@ -94,7 +94,7 @@ if __name__ == "__main__":
 
     burst_latency = asyncio.run(run_load_test(
         num_requests = 250,
-        concurrency = 10,
+        concurrency = 50,
         reuse_prefix = True,
         use_cache = True
     ))

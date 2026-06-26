@@ -4,12 +4,14 @@ import torch
 from fastapi import FastAPI
 from app.model import InferenceModel
 from app.cache import LRUTTLCache
+from app.config import CACHE_ENABLED, CACHE_MAX_SIZE, CACHE_TTL_SECONDS
 from app.tracker import TrackPerformance
 from app.schemas import PredictionRequest, PredictResponse
 
 app = FastAPI()
 model = InferenceModel()
-cache = LRUTTLCache()
+cache = LRUTTLCache(max_size=CACHE_MAX_SIZE, ttl_seconds=CACHE_TTL_SECONDS)
+cache.enabled = CACHE_ENABLED
 tracker = TrackPerformance()
 
 def make_cache_key(features, k = 4):
@@ -24,7 +26,7 @@ def agent_policy(risk):
     if risk > 0.8:
         cache.enabled = False
     else:
-        cache.enabled = True
+        cache.enabled = CACHE_ENABLED
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictionRequest):
@@ -44,12 +46,13 @@ def predict(request: PredictionRequest):
     
     if h is None:
         h = model.get_embedding(x)
-        if h is not None:
+        if request.use_cache and h is not None:
             cache.set(cache_key, h)
     
     y = model.predict_from_embedding(h)
 
-    risk_score = float(torch.norm(h).item() / 10)
+    expected_norm = h.shape[-1] ** 0.5
+    risk_score = abs(torch.norm(h).item() - expected_norm) / expected_norm
 
     agent_policy(risk_score)
     latency = (time.time() - start) * 1000
@@ -76,8 +79,6 @@ def health():
         "status": "ok",
         "cache_enabled": cache.enabled,
     }    
-
-
 
 
 
