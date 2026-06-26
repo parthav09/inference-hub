@@ -282,4 +282,4 @@ The next engineering step is to make the experiment scientifically valid: fix ca
 
 ## License
 
-No license file is currently included.
+No license file is included yet.
