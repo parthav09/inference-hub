@@ -267,7 +267,7 @@ python experiments/load_test.py
 python experiments/plot_day3.py
 ```
 
-The load test requires `httpx`. Plotting additionally requires `matplotlib`; the drift helper requires `numpy`. The latter two are not currently declared in `requirements.txt`.
+The load test requires `httpx`. Plotting additionally requires `matplotlib`; the drift helper requires `numpy`. These dependencies are declared in `requirements.txt`.
 
 ## Project status
 

@@ -4,3 +4,5 @@ torch
 pydantic
 anyio
 httpx
+numpy
+matplotlib
